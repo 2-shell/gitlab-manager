@@ -6,51 +6,64 @@ import logging as log
 from requests import exceptions
 
 class MergeRequest:
-    def __init__(self, mr):
+    def __init__(self, mr, label_prefix='CL', label_sep=':'):
         self.Id = mr.iid
         self.Author = mr.author['username']
         self.Title = mr.title
         self.Description = mr.description
         self.Label = "info"
+        self.LabelPrefix = label_prefix
+        self.LabelSeparator = label_sep
         if len(mr.labels) == 1:
             self.Label = "[{}]".format(mr.labels[0])
-            
-    
-    def print_mr(self):
-        return "### {}: {}\n\n{}\n\n    * by: {}\n\n    * Merge Request ID:{}\n".format(self.Label, self.Title, self.Description, self.Author, self.Id)
+        else:
+            for label in mr.labels:
+                if label.startswith(self.LabelPrefix+self.LabelSeparator):
+                    self.Label = f"[{label.split(self.LabelSeparator, maxsplit=1)[-1].strip()}]"
+                    break
 
-def list_mrs(project, state, wip, labels=[]):
-    print("\nHere is the list of MRs for your chosen project:\n")
+    def print_mr(self, ids_only=False):
+        if ids_only:
+            return f"{self.Id} "
+        else:
+            return "### {}: {}\n\n{}\n\n    * by: {}\n\n    * Merge Request ID:{}\n".format(self.Label, self.Title, self.Description, self.Author, self.Id)
+
+def list_mrs(project, args):
+    if not args.output_ids:
+        print("\nHere is the list of MRs for your chosen project:\n")
+    labels = [item for item in args.labels.split(',')]
     mrs = []
     if len(labels) > 0:
-        mrs = project.mergerequests.list(state=state, order_by='updated_at', wip=wip, labels=labels)
+        mrs = project.mergerequests.list(state=args.state, order_by='updated_at', wip=args.wip, labels=labels, all=True)
     else:
-        mrs = project.mergerequests.list(state=state, order_by='updated_at', wip=wip)
+        mrs = project.mergerequests.list(state=args.state, order_by='updated_at', wip=args.wip)
     all_mr = ""
     for mr in mrs:
-        current = MergeRequest(mr)
-        all_mr = all_mr + "{}\n\n".format(current.print_mr())
+        current = MergeRequest(mr, args.cl_type_label_prefix, args.cl_type_label_separator)
+        all_mr = all_mr + "{}\n\n".format(current.print_mr(args.output_ids))
     print(all_mr)
     return all_mr
 
-def update_mr(project, mr_id, label=None, tag=None):
-    mr = project.mergerequests.get(mr_id)
-    if label is not None:
-        mr.labels = [label]
-    
-    if tag is not None:
-        milestones = project.milestones.list(state='active', search=tag)
-        if len(milestones) == 1:
-            milestone = milestones[0]
-        elif len(milestones) == 0:
-            print("create milestone")
-            milestone = project.milestones.create({'title': tag})
-        else:
-            print("please verify your tag")
-            exit()
-        mr.milestone_id = milestone.id
-    mr.save()
-    
+def update_mr(project, args):
+    mrs = project.mergerequests.list(query_parameters={'iids[]': ','.join(args.mr_ids)})
+    for mr in mrs:
+        if args.label is not None and args.label not in mr.labels:
+            if args.keep_existing_labels:
+                mr.labels.append(args.label)
+            else:
+                mr.labels = [args.label]
+        if args.tag is not None:
+            milestones = project.milestones.list(state='active', search=args.tag)
+            if len(milestones) == 1:
+                milestone = milestones[0]
+            elif len(milestones) == 0:
+                print("create milestone")
+                milestone = project.milestones.create({'title': args.tag})
+            else:
+                print("please verify your tag")
+                exit()
+            mr.milestone_id = milestone.id
+        mr.save()
 
 def print_changelog(project, tag, push=False):
     print("\nYour changelog for {} on Project {}:\n".format(tag, project.name))
@@ -77,6 +90,12 @@ def init_argparse():
                                help='Specify gitlab url ex: https://gitlab.com')
         optionals.add_argument("--gitlab-token", dest='gitlab_token', action='store', type=str,
                                help='Specify private gitlab token')
+        optionals.add_argument("--changelog-type-label-prefix", dest='cl_type_label_prefix',
+                               action='store', type=str, default='CL',
+                               help='Gitlab label prefix for changelog entry types')
+        optionals.add_argument("--changelog-type-label-separator", dest='cl_type_label_separator',
+                               action='store', type=str, default=':',
+                               help='seperator token of Gitlab label prefixes for changelog entry types')
         
         subparsers = parser.add_subparsers(dest='command')
         mr_group = subparsers.add_parser('mr')
@@ -84,6 +103,8 @@ def init_argparse():
 
         subparsers = mr_group.add_subparsers(dest='action')
         ls_mr = subparsers.add_parser('ls')
+        ls_mr.add_argument("--ids", dest='output_ids', action='store_true',
+                           help='print MR ids only')
         ls_mr.add_argument("--wip", dest='wip', action='store', type=str,
         help='search wip or not', choices=['yes', 'no'])
         ls_mr.add_argument("--state", dest='state', action='store', type=str,
@@ -94,11 +115,15 @@ def init_argparse():
                            help='Comma separated list of labels to filter MRs for',
                            default='')
         update_mr = subparsers.add_parser('update')
-        update_mr.add_argument('mr_id')
+        update_mr.add_argument('mr_ids', nargs='+',
+                               help='one or more MR ids')
         update_mr.add_argument("--label", dest='label', action='store', type=str,
         help='put a speficic label ex: Feature')
         update_mr.add_argument("--tag", dest='tag', action='store', type=str,
         help='put a speficic tag ex: 0.2.0')
+        update_mr.add_argument("--keep-existing-labels", dest='keep_existing_labels',
+                               action='store_true',
+                               help='do not replace labels')
         
         subparsers = changelog_group.add_subparsers(dest='action')
         print_changelog = subparsers.add_parser('print', help='print changelog')
@@ -153,9 +178,9 @@ if __name__ == '__main__':
     project = projects[0]
     if args.command == "mr":
         if args.action == "ls":
-            list_mrs(project, args.state, args.wip, [item for item in args.labels.split(',')])
+            list_mrs(project, args)
         if args.action == "update":
-            update_mr(project, args.mr_id, args.label, args.tag)
+            update_mr(project, args)
     if args.command == "changelog":
         push = False
         if args.action == "push":
