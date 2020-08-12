@@ -76,6 +76,7 @@ def update_mr(project, args):
             mr.save()
 
 def fetch_release_milestone(project, milestone):
+    log.info(f"Fetching release milestone {milestone} ...")
     release_milestones = project.milestones.list(title=milestone)
     if len(release_milestones) == 0:
         log.error(f"Release milestone {milestone} not found in project {project.name} ({args.project})")
@@ -224,8 +225,10 @@ def render_changelog(gitlab, project, args):
 
             ret += f"### {normalize_product_name(product)} ({product_count})\n\n"
             ret += product_str
-
-    print(ret)
+    if args.output_format == 'markdown':
+        print(ret)
+    if args.output_format == 'html':
+        print(gl.markdown(ret, True, project.path_with_namespace))
     return ret
 
 
@@ -315,6 +318,9 @@ def init_argparse():
                                       help="strip internal information (MRs, authors, etc.) from output")
         render_changelog.add_argument("--strip-version-name-prefix",
                                       help="Prefix that shall be stripped from version tags (i.e. milestones) for output")
+        render_changelog.add_argument("-F", "--output-format", choices=['markdown','html', 'none'],
+                                      default='markdown',
+                                      help="Ouput format")
         arguments = parser.parse_args()
 
         if "command" in arguments:
