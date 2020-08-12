@@ -85,6 +85,45 @@ def fetch_release_milestone(project, milestone):
         return None
     return release_milestones[0]
 
+def collect_mr(group, project, args):
+    release_milestone = fetch_release_milestone(project, args.release_milestone)
+    if release_milestone is None:
+        if args.force:
+            log.info(f"Creating release milestone {args.release_milestone} in project {project.name} ({project.id})")
+            release_milestone = project.milestones.create({'title': args.release_milestone})
+        else:
+            log.error("Cannot continue without release milestone")
+            exit()
+
+    log.info(f"Collecting merged MRs for closed issues in sprints: {', '.join(args.sprint_milestones)}")
+    mr_ids = []
+    for sprint in args.sprint_milestones:
+        milestones = group.milestones.list(title=sprint)
+        if len(milestones) == 0:
+            log.warning(f"Sprint milestone '{sprint}' not found in group '{group.name} ({args.group_id})'")
+            continue
+        elif len(milestones) > 1:
+            log.error(f"Ambiguous sprint milestone '{sprint}' found in group '{group.name} ({args.group_id})': {', '.join([item.title for item in milestones])}")
+            exit()
+        issues = milestones[0].issues()
+        for i in issues:
+            if i.state != 'closed' or i.project_id != project.id:
+                continue
+            project_issue = project.issues.get(i.iid)
+            related_mrs = project_issue.related_merge_requests()
+            for current_mr in related_mrs:
+                if current_mr['state'] != 'merged' or current_mr['project_id'] != project.id:
+                    continue
+                log.info(f"   * !{current_mr['iid']} ({current_mr['title']})")
+                mr_ids.append(str(current_mr['iid']))
+
+    log.info(f"Fetching MR objects for ids: {', '.join(mr_ids)}")
+    mrs = project.mergerequests.list(query_parameters={'iids[]': ','.join(mr_ids)})
+    for current_mr in mrs:
+        log.info(f"    * Assigning release milestone {release_milestone.title} ({release_milestone.id}) to MR !{current_mr.iid} ({current_mr.title})")
+        current_mr.milestone_id = release_milestone.id
+        if args.force:
+            current_mr.save()
 
 def print_changelog(project, args, push=False):
     if args.changelog_title is not None:
@@ -162,6 +201,14 @@ def init_argparse():
                                help='put a speficic tag ex: 0.2.0')
         update_mr.add_argument("--replace-existing-labels", action='store_true',
                                help='replace labels')
+        collect_mr = subparsers.add_parser('collect')
+        collect_mr.add_argument('release_milestone',
+                                help='milestone representing the release')
+        collect_mr.add_argument('group_id',
+                                help='ID of the group that sprint milestones belong to')
+        collect_mr.add_argument('sprint_milestones', nargs='+',
+                                help='one or more milestone titles representing sprints')
+
         subparsers = changelog_group.add_subparsers(dest='action')
         print_changelog = subparsers.add_parser('print',
                                                 help='print changelog')
@@ -233,6 +280,20 @@ if __name__ == '__main__':
             list_mrs(project, args)
         if args.action == "update":
             update_mr(project, args)
+        if args.action == "collect":
+            group = None
+            try:
+                group = gl.groups.get(args.group_id)
+            except exceptions.MissingSchema:
+                log.error("Error with the URL defined")
+                exit()
+            except gitlab.exceptions.GitlabAuthenticationError:
+                log.error("Wrong private token")
+                exit()
+            if group is None:
+                log.error(f"Group {args.group_id} not found!")
+                exit()
+            collect_mr(group, project, args)
     if args.command == "changelog":
         push = False
         if args.action == "push":
