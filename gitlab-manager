@@ -141,6 +141,93 @@ def print_changelog(project, args, push=False):
         if args.force:
                  project.releases.create({'name': str(args.tag), 'tag_name': args.tag, 'description': all_mr})
 
+def normalize_mr_title(title):
+    ret = title
+    if ret.startswith('Resolve '):
+        ret = ret.replace('Resolve ', '', 1).strip('"')
+    return ret
+
+def normalize_product_name(product):
+    return product
+
+def normalize_version_name(version, args):
+    ret = version
+    if args.strip_version_name_prefix is not None and ret.startswith(args.strip_version_name_prefix):
+        ret = ret.replace(args.strip_version_name_prefix, '', 1)
+    return ret
+
+def render_changelog(gitlab, project, args):
+    ret = ""
+
+    releases = []
+    ms_ids   = []
+    if len(args.release_milestones) == 1 and args.release_milestones[0].lower() == 'all':
+        releases = project.milestones.list(all=True)
+        ms_ids   = [item.id for item in releases]
+    else:
+        for ms_title in args.release_milestones:
+            ms = fetch_release_milestone(project, ms_title)
+            if ms is not None:
+                releases.append(ms)
+                ms_ids.append(ms.id)
+
+    if len(releases) == 0:
+        log.error("Cannot continue without at least one release milestone")
+        exit()
+
+    labels = [item for item in args.labels.split(',')]
+    mrs = project.mergerequests.list(order_by='updated_at', labels=labels, all=True)
+
+    cl_sections = {}
+    for mr in mrs:
+        if mr.milestone is None or mr.milestone['id'] not in ms_ids:
+            continue
+
+        version = mr.milestone['title']
+        product = 'General'
+        cl_type = 'Other'
+
+        for label in mr.labels:
+            if label.startswith(args.product_label_prefix+args.product_label_separator):
+                product = label.split(args.product_label_separator, maxsplit=1)[-1].strip()
+            if label.startswith(args.cl_type_label_prefix+args.cl_type_label_separator):
+                cl_type = label.split(args.cl_type_label_separator, maxsplit=1)[-1].strip()
+
+        if version not in cl_sections:
+            cl_sections[version] = {}
+        if product not in cl_sections[version]:
+            cl_sections[version][product] = {}
+        if cl_type not in cl_sections[version][product]:
+            cl_sections[version][product][cl_type] = []
+
+        cl_sections[version][product][cl_type].append(mr)
+
+    ret += "# Changelog\n\n"
+    for version in sorted(cl_sections):
+        if len(cl_sections) > 1:
+            ret += f"## {normalize_version_name(version, args)}\n\n"
+        for product in sorted(cl_sections[version]):
+            product_count = 0
+            product_str   = ''
+            for cl_type in sorted(cl_sections[version][product]):
+                product_str += f"#### {cl_type} ({len(cl_sections[version][product][cl_type])})\n\n"
+                for mr in cl_sections[version][product][cl_type]:
+                    product_count += 1
+                    product_str += "*"
+                    if not args.strip_internals:
+                        product_str += f" **!{mr.iid}**"
+                    product_str += f" {normalize_mr_title(mr.title)}"
+                    if not args.strip_internals:
+                        product_str += f" *(@{mr.author['username']})*"
+                    product_str += "  \n"
+                product_str += "\n\n"
+
+            ret += f"### {normalize_product_name(product)} ({product_count})\n\n"
+            ret += product_str
+
+    print(ret)
+    return ret
+
 
 
 def init_argparse():
@@ -218,6 +305,16 @@ def init_argparse():
                                                help='Push changelog to releases in gitlab')
         push_changelog.add_argument("tag",
                                     help='generate changelog for specific tag ex: 0.2.0')
+        render_changelog = subparsers.add_parser('render',
+                                                 help='Render changelog')
+        render_changelog.add_argument("release_milestones", nargs='+',
+                                      help="milestones representing one or more releases")
+        render_changelog.add_argument("--labels", default='',
+                                      help='Comma separated list of labels for filtering MRs')
+        render_changelog.add_argument("--strip-internals", action='store_true',
+                                      help="strip internal information (MRs, authors, etc.) from output")
+        render_changelog.add_argument("--strip-version-name-prefix",
+                                      help="Prefix that shall be stripped from version tags (i.e. milestones) for output")
         arguments = parser.parse_args()
 
         if "command" in arguments:
@@ -300,6 +397,8 @@ if __name__ == '__main__':
             push = True
         if args.action == "print":
             print_changelog(project, args, push)
+        if args.action == "render":
+            render_changelog(gl, project, args)
 
     if not args.force:
         log.info("===== DRY RUN =====")
