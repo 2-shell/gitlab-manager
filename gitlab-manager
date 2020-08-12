@@ -26,7 +26,11 @@ class MergeRequest:
         if ids_only:
             return f"{self.Id} "
         else:
-            return "### {}: {}\n\n{}\n\n    * by: {}\n\n    * Merge Request ID:{}\n".format(self.Label, self.Title, self.Description, self.Author, self.Id)
+            out =  f"### {self.Label}: {self.Title}\n\n"
+            out += f"{self.Description}\n\n"
+            out += f"    * by: {self.Author}  \n"
+            out += f"    * Merge Request ID: !{self.Id}  \n\n"
+            return out
 
 def list_mrs(project, args):
     if not args.output_ids:
@@ -48,35 +52,56 @@ def update_mr(project, args):
     mrs = project.mergerequests.list(query_parameters={'iids[]': ','.join(args.mr_ids)})
     for mr in mrs:
         if args.label is not None and args.label not in mr.labels:
-            if args.keep_existing_labels:
-                mr.labels.append(args.label)
-            else:
+            if args.replace_existing_labels:
+                log.info(f"    * Replacing all labels with '{args.label}' in MR !{mr.iid}")
                 mr.labels = [args.label]
+            else:
+                log.info(f"    * Appending label '{args.label}' to MR !{mr.iid}")
+                mr.labels.append(args.label)
         if args.tag is not None:
+            milestone = None
             milestones = project.milestones.list(state='active', search=args.tag)
             if len(milestones) == 1:
                 milestone = milestones[0]
             elif len(milestones) == 0:
-                print("create milestone")
-                milestone = project.milestones.create({'title': args.tag})
+                log.info(f"Create milestone {args.tag}")
+                if args.force:
+                    milestone = project.milestones.create({'title': args.tag})
             else:
                 print("please verify your tag")
                 exit()
-            mr.milestone_id = milestone.id
-        mr.save()
+            if milestone is not None:
+                mr.milestone_id = milestone.id
+        if args.force:
+            mr.save()
 
-def print_changelog(project, tag, push=False):
-    print("\nYour changelog for {} on Project {}:\n".format(tag, project.name))
-    mrs = project.mergerequests.list(order_by='updated_at', milestone=tag)
+def fetch_release_milestone(project, milestone):
+    release_milestones = project.milestones.list(title=milestone)
+    if len(release_milestones) == 0:
+        log.error(f"Release milestone {milestone} not found in project {project.name} ({args.project})")
+        return None
+    elif len(release_milestones) > 1:
+        log.error(f"Ambiguous release milestone '{milestone}' found in project '{project.name} ({args.project})': {', '.join([item.title for item in release_milestones])}")
+        return None
+    return release_milestones[0]
+
+
+def print_changelog(project, args, push=False):
+    if args.changelog_title is not None:
+        print(f"\n{args.changelog_title}\n\n")
+    else:
+        print("\nYour changelog for {} on Project {}:\n".format(args.tag, project.name))
+    mrs = project.mergerequests.list(order_by='updated_at', milestone=args.tag)
     all_mr = ""
     for mr in mrs:
         current = MergeRequest(mr)
         all_mr = all_mr + "{}\n\n------------------\n\n".format(current.print_mr())
     print(all_mr)
     if push:
-        project.releases.create({'name': str(tag), 'tag_name': tag, 'description': all_mr})
-        #project.releases.delete(tag)
-        #print(release)
+        log.info(f"Create release '{args.tag}': {all_mr}")
+        if args.force:
+                 project.releases.create({'name': str(args.tag), 'tag_name': args.tag, 'description': all_mr})
+
 
 
 def init_argparse():
@@ -86,17 +111,31 @@ def init_argparse():
         '''override defaults or configuration'''
         parser.add_argument("project")
         optionals = parser.add_argument_group()
-        optionals.add_argument("--gitlab-url", dest='gitlab_url', action='store', type=str,
+        optionals.add_argument("--gitlab-url",
                                help='Specify gitlab url ex: https://gitlab.com')
-        optionals.add_argument("--gitlab-token", dest='gitlab_token', action='store', type=str,
+        optionals.add_argument("--gitlab-token",
                                help='Specify private gitlab token')
+        optionals.add_argument("-q", "--quiet", action='store_true',
+                               help='No diagnostic messages')
+        optionals.add_argument('--log-format', type=str, default='%(message)s',
+                               help='Python log format string')
+        optionals.add_argument("-f", "--force", action='store_true',
+                               help='Perform changes instead of doing a DRY run')
+        optionals.add_argument("--changelog-title",
+                               help='Changelog title')
         optionals.add_argument("--changelog-type-label-prefix", dest='cl_type_label_prefix',
-                               action='store', type=str, default='CL',
+                               default='CL',
                                help='Gitlab label prefix for changelog entry types')
         optionals.add_argument("--changelog-type-label-separator", dest='cl_type_label_separator',
-                               action='store', type=str, default=':',
+                               default=':',
                                help='seperator token of Gitlab label prefixes for changelog entry types')
-        
+        optionals.add_argument("--product-label-prefix", dest='product_label_prefix',
+                               default='P',
+                               help='Gitlab label prefix for products')
+        optionals.add_argument("--product-label-separator", dest='product_label_separator',
+                               default=':',
+                               help='seperator token of Gitlab label prefixes for products')
+
         subparsers = parser.add_subparsers(dest='command')
         mr_group = subparsers.add_parser('mr')
         changelog_group = subparsers.add_parser('changelog')
@@ -105,34 +144,35 @@ def init_argparse():
         ls_mr = subparsers.add_parser('ls')
         ls_mr.add_argument("--ids", dest='output_ids', action='store_true',
                            help='print MR ids only')
-        ls_mr.add_argument("--wip", dest='wip', action='store', type=str,
-        help='search wip or not', choices=['yes', 'no'])
-        ls_mr.add_argument("--state", dest='state', action='store', type=str,
+        ls_mr.add_argument("--wip",
+                           help='search wip or not', choices=['yes', 'no'])
+        ls_mr.add_argument("--state",
                            help='filter for the specified state',
                            choices=['all', 'opened', 'closed', 'locked', 'merged'],
-                           default='opened')
-        ls_mr.add_argument("--labels", dest='labels', action='store', type=str,
-                           help='Comma separated list of labels to filter MRs for',
-                           default='')
+                           default='merged')
+        ls_mr.add_argument("--labels",
+                           default='',
+                           help='Comma separated list of labels to filter MRs for')
         update_mr = subparsers.add_parser('update')
         update_mr.add_argument('mr_ids', nargs='+',
                                help='one or more MR ids')
-        update_mr.add_argument("--label", dest='label', action='store', type=str,
-        help='put a speficic label ex: Feature')
-        update_mr.add_argument("--tag", dest='tag', action='store', type=str,
-        help='put a speficic tag ex: 0.2.0')
-        update_mr.add_argument("--keep-existing-labels", dest='keep_existing_labels',
-                               action='store_true',
-                               help='do not replace labels')
-        
+        update_mr.add_argument("--label",
+                               help='put a speficic label ex: Feature')
+        update_mr.add_argument("--tag",
+                               help='put a speficic tag ex: 0.2.0')
+        update_mr.add_argument("--replace-existing-labels", action='store_true',
+                               help='replace labels')
         subparsers = changelog_group.add_subparsers(dest='action')
-        print_changelog = subparsers.add_parser('print', help='print changelog')
+        print_changelog = subparsers.add_parser('print',
+                                                help='print changelog')
         print_changelog.add_argument("tag",
-        help='generate changelog for specific tag ex: 0.2.0')
-        push_changelog = subparsers.add_parser('push', help='Push changelog to releases in gitlab')
+                                     help='generate changelog for specific tag ex: 0.2.0')
+        push_changelog = subparsers.add_parser('push',
+                                               help='Push changelog to releases in gitlab')
         push_changelog.add_argument("tag",
-        help='generate changelog for specific tag ex: 0.2.0')
+                                    help='generate changelog for specific tag ex: 0.2.0')
         arguments = parser.parse_args()
+
         if "command" in arguments:
             if arguments.command =="mr":
                 if arguments.action == "update" and (not arguments.label and not arguments.tag):
@@ -144,15 +184,22 @@ def init_argparse():
                     changelog_group.error("One action is required")
         else:
             parser.error("One command is needed")
+
     except argparse.ArgumentError as e:
-        log.error("Error parsing arguments")
+        print("Error parsing arguments")
         raise e
+
     else:
-        log.debug(f"Arguments have been parsed: {arguments}")
         return arguments
 
 if __name__ == '__main__':
     args = init_argparse()
+
+    if not args.quiet:
+        log.basicConfig(format=args.log_format, level=log.INFO)
+    else:
+        log.basicConfig(format=args.log_format)
+
     if args.gitlab_url is not None and args.gitlab_token is not None:
         gl = gitlab.Gitlab(args.gitlab_url, private_token=args.gitlab_token)
     else:
@@ -161,6 +208,7 @@ if __name__ == '__main__':
         except gitlab.config.GitlabConfigMissingError as e:
             print(e)
             exit()
+
     try:
         if args.project.isdecimal():
             projects = [gl.projects.get(args.project)]
@@ -176,6 +224,10 @@ if __name__ == '__main__':
         print("can't find the project {}\n {}".format(args.project, projects))
         exit()
     project = projects[0]
+
+    if not args.force:
+        log.info("===== DRY RUN =====")
+
     if args.command == "mr":
         if args.action == "ls":
             list_mrs(project, args)
@@ -185,4 +237,8 @@ if __name__ == '__main__':
         push = False
         if args.action == "push":
             push = True
-        print_changelog(project, args.tag, push)
+        if args.action == "print":
+            print_changelog(project, args, push)
+
+    if not args.force:
+        log.info("===== DRY RUN =====")
