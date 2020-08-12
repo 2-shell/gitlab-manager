@@ -26,7 +26,11 @@ class MergeRequest:
         if ids_only:
             return f"{self.Id} "
         else:
-            return "### {}: {}\n\n{}\n\n    * by: {}\n\n    * Merge Request ID:{}\n".format(self.Label, self.Title, self.Description, self.Author, self.Id)
+            out =  f"### {self.Label}: {self.Title}\n\n"
+            out += f"{self.Description}\n\n"
+            out += f"    * by: {self.Author}  \n"
+            out += f"    * Merge Request ID: !{self.Id}  \n\n"
+            return out
 
 def list_mrs(project, args):
     if not args.output_ids:
@@ -48,35 +52,182 @@ def update_mr(project, args):
     mrs = project.mergerequests.list(query_parameters={'iids[]': ','.join(args.mr_ids)})
     for mr in mrs:
         if args.label is not None and args.label not in mr.labels:
-            if args.keep_existing_labels:
-                mr.labels.append(args.label)
-            else:
+            if args.replace_existing_labels:
+                log.info(f"    * Replacing all labels with '{args.label}' in MR !{mr.iid}")
                 mr.labels = [args.label]
+            else:
+                log.info(f"    * Appending label '{args.label}' to MR !{mr.iid}")
+                mr.labels.append(args.label)
         if args.tag is not None:
+            milestone = None
             milestones = project.milestones.list(state='active', search=args.tag)
             if len(milestones) == 1:
                 milestone = milestones[0]
             elif len(milestones) == 0:
-                print("create milestone")
-                milestone = project.milestones.create({'title': args.tag})
+                log.info(f"Create milestone {args.tag}")
+                if args.force:
+                    milestone = project.milestones.create({'title': args.tag})
             else:
                 print("please verify your tag")
                 exit()
-            mr.milestone_id = milestone.id
-        mr.save()
+            if milestone is not None:
+                mr.milestone_id = milestone.id
+        if args.force:
+            mr.save()
 
-def print_changelog(project, tag, push=False):
-    print("\nYour changelog for {} on Project {}:\n".format(tag, project.name))
-    mrs = project.mergerequests.list(order_by='updated_at', milestone=tag)
+def fetch_release_milestone(project, milestone):
+    release_milestones = project.milestones.list(title=milestone)
+    if len(release_milestones) == 0:
+        log.error(f"Release milestone {milestone} not found in project {project.name} ({args.project})")
+        return None
+    elif len(release_milestones) > 1:
+        log.error(f"Ambiguous release milestone '{milestone}' found in project '{project.name} ({args.project})': {', '.join([item.title for item in release_milestones])}")
+        return None
+    return release_milestones[0]
+
+def collect_mr(group, project, args):
+    release_milestone = fetch_release_milestone(project, args.release_milestone)
+    if release_milestone is None:
+        if args.force:
+            log.info(f"Creating release milestone {args.release_milestone} in project {project.name} ({project.id})")
+            release_milestone = project.milestones.create({'title': args.release_milestone})
+        else:
+            log.error("Cannot continue without release milestone")
+            exit()
+
+    log.info(f"Collecting merged MRs for closed issues in sprints: {', '.join(args.sprint_milestones)}")
+    mr_ids = []
+    for sprint in args.sprint_milestones:
+        milestones = group.milestones.list(title=sprint)
+        if len(milestones) == 0:
+            log.warning(f"Sprint milestone '{sprint}' not found in group '{group.name} ({args.group_id})'")
+            continue
+        elif len(milestones) > 1:
+            log.error(f"Ambiguous sprint milestone '{sprint}' found in group '{group.name} ({args.group_id})': {', '.join([item.title for item in milestones])}")
+            exit()
+        issues = milestones[0].issues()
+        for i in issues:
+            if i.state != 'closed' or i.project_id != project.id:
+                continue
+            project_issue = project.issues.get(i.iid)
+            related_mrs = project_issue.related_merge_requests()
+            for current_mr in related_mrs:
+                if current_mr['state'] != 'merged' or current_mr['project_id'] != project.id:
+                    continue
+                log.info(f"   * !{current_mr['iid']} ({current_mr['title']})")
+                mr_ids.append(str(current_mr['iid']))
+
+    log.info(f"Fetching MR objects for ids: {', '.join(mr_ids)}")
+    mrs = project.mergerequests.list(query_parameters={'iids[]': ','.join(mr_ids)})
+    for current_mr in mrs:
+        log.info(f"    * Assigning release milestone {release_milestone.title} ({release_milestone.id}) to MR !{current_mr.iid} ({current_mr.title})")
+        current_mr.milestone_id = release_milestone.id
+        if args.force:
+            current_mr.save()
+
+def print_changelog(project, args, push=False):
+    if args.changelog_title is not None:
+        print(f"\n{args.changelog_title}\n\n")
+    else:
+        print("\nYour changelog for {} on Project {}:\n".format(args.tag, project.name))
+    mrs = project.mergerequests.list(order_by='updated_at', milestone=args.tag)
     all_mr = ""
     for mr in mrs:
         current = MergeRequest(mr)
         all_mr = all_mr + "{}\n\n------------------\n\n".format(current.print_mr())
     print(all_mr)
     if push:
-        project.releases.create({'name': str(tag), 'tag_name': tag, 'description': all_mr})
-        #project.releases.delete(tag)
-        #print(release)
+        log.info(f"Create release '{args.tag}': {all_mr}")
+        if args.force:
+                 project.releases.create({'name': str(args.tag), 'tag_name': args.tag, 'description': all_mr})
+
+def normalize_mr_title(title):
+    ret = title
+    if ret.startswith('Resolve '):
+        ret = ret.replace('Resolve ', '', 1).strip('"')
+    return ret
+
+def normalize_product_name(product):
+    return product
+
+def normalize_version_name(version, args):
+    ret = version
+    if args.strip_version_name_prefix is not None and ret.startswith(args.strip_version_name_prefix):
+        ret = ret.replace(args.strip_version_name_prefix, '', 1)
+    return ret
+
+def render_changelog(gitlab, project, args):
+    ret = ""
+
+    releases = []
+    ms_ids   = []
+    if len(args.release_milestones) == 1 and args.release_milestones[0].lower() == 'all':
+        releases = project.milestones.list(all=True)
+        ms_ids   = [item.id for item in releases]
+    else:
+        for ms_title in args.release_milestones:
+            ms = fetch_release_milestone(project, ms_title)
+            if ms is not None:
+                releases.append(ms)
+                ms_ids.append(ms.id)
+
+    if len(releases) == 0:
+        log.error("Cannot continue without at least one release milestone")
+        exit()
+
+    labels = [item for item in args.labels.split(',')]
+    mrs = project.mergerequests.list(order_by='updated_at', labels=labels, all=True)
+
+    cl_sections = {}
+    for mr in mrs:
+        if mr.milestone is None or mr.milestone['id'] not in ms_ids:
+            continue
+
+        version = mr.milestone['title']
+        product = 'General'
+        cl_type = 'Other'
+
+        for label in mr.labels:
+            if label.startswith(args.product_label_prefix+args.product_label_separator):
+                product = label.split(args.product_label_separator, maxsplit=1)[-1].strip()
+            if label.startswith(args.cl_type_label_prefix+args.cl_type_label_separator):
+                cl_type = label.split(args.cl_type_label_separator, maxsplit=1)[-1].strip()
+
+        if version not in cl_sections:
+            cl_sections[version] = {}
+        if product not in cl_sections[version]:
+            cl_sections[version][product] = {}
+        if cl_type not in cl_sections[version][product]:
+            cl_sections[version][product][cl_type] = []
+
+        cl_sections[version][product][cl_type].append(mr)
+
+    ret += "# Changelog\n\n"
+    for version in sorted(cl_sections):
+        if len(cl_sections) > 1:
+            ret += f"## {normalize_version_name(version, args)}\n\n"
+        for product in sorted(cl_sections[version]):
+            product_count = 0
+            product_str   = ''
+            for cl_type in sorted(cl_sections[version][product]):
+                product_str += f"#### {cl_type} ({len(cl_sections[version][product][cl_type])})\n\n"
+                for mr in cl_sections[version][product][cl_type]:
+                    product_count += 1
+                    product_str += "*"
+                    if not args.strip_internals:
+                        product_str += f" **!{mr.iid}**"
+                    product_str += f" {normalize_mr_title(mr.title)}"
+                    if not args.strip_internals:
+                        product_str += f" *(@{mr.author['username']})*"
+                    product_str += "  \n"
+                product_str += "\n\n"
+
+            ret += f"### {normalize_product_name(product)} ({product_count})\n\n"
+            ret += product_str
+
+    print(ret)
+    return ret
+
 
 
 def init_argparse():
@@ -86,17 +237,31 @@ def init_argparse():
         '''override defaults or configuration'''
         parser.add_argument("project")
         optionals = parser.add_argument_group()
-        optionals.add_argument("--gitlab-url", dest='gitlab_url', action='store', type=str,
+        optionals.add_argument("--gitlab-url",
                                help='Specify gitlab url ex: https://gitlab.com')
-        optionals.add_argument("--gitlab-token", dest='gitlab_token', action='store', type=str,
+        optionals.add_argument("--gitlab-token",
                                help='Specify private gitlab token')
+        optionals.add_argument("-q", "--quiet", action='store_true',
+                               help='No diagnostic messages')
+        optionals.add_argument('--log-format', type=str, default='%(message)s',
+                               help='Python log format string')
+        optionals.add_argument("-f", "--force", action='store_true',
+                               help='Perform changes instead of doing a DRY run')
+        optionals.add_argument("--changelog-title",
+                               help='Changelog title')
         optionals.add_argument("--changelog-type-label-prefix", dest='cl_type_label_prefix',
-                               action='store', type=str, default='CL',
+                               default='CL',
                                help='Gitlab label prefix for changelog entry types')
         optionals.add_argument("--changelog-type-label-separator", dest='cl_type_label_separator',
-                               action='store', type=str, default=':',
+                               default=':',
                                help='seperator token of Gitlab label prefixes for changelog entry types')
-        
+        optionals.add_argument("--product-label-prefix", dest='product_label_prefix',
+                               default='P',
+                               help='Gitlab label prefix for products')
+        optionals.add_argument("--product-label-separator", dest='product_label_separator',
+                               default=':',
+                               help='seperator token of Gitlab label prefixes for products')
+
         subparsers = parser.add_subparsers(dest='command')
         mr_group = subparsers.add_parser('mr')
         changelog_group = subparsers.add_parser('changelog')
@@ -105,34 +270,53 @@ def init_argparse():
         ls_mr = subparsers.add_parser('ls')
         ls_mr.add_argument("--ids", dest='output_ids', action='store_true',
                            help='print MR ids only')
-        ls_mr.add_argument("--wip", dest='wip', action='store', type=str,
-        help='search wip or not', choices=['yes', 'no'])
-        ls_mr.add_argument("--state", dest='state', action='store', type=str,
+        ls_mr.add_argument("--wip",
+                           help='search wip or not', choices=['yes', 'no'])
+        ls_mr.add_argument("--state",
                            help='filter for the specified state',
                            choices=['all', 'opened', 'closed', 'locked', 'merged'],
-                           default='opened')
-        ls_mr.add_argument("--labels", dest='labels', action='store', type=str,
-                           help='Comma separated list of labels to filter MRs for',
-                           default='')
+                           default='merged')
+        ls_mr.add_argument("--labels",
+                           default='',
+                           help='Comma separated list of labels to filter MRs for')
         update_mr = subparsers.add_parser('update')
         update_mr.add_argument('mr_ids', nargs='+',
                                help='one or more MR ids')
-        update_mr.add_argument("--label", dest='label', action='store', type=str,
-        help='put a speficic label ex: Feature')
-        update_mr.add_argument("--tag", dest='tag', action='store', type=str,
-        help='put a speficic tag ex: 0.2.0')
-        update_mr.add_argument("--keep-existing-labels", dest='keep_existing_labels',
-                               action='store_true',
-                               help='do not replace labels')
-        
+        update_mr.add_argument("--label",
+                               help='put a speficic label ex: Feature')
+        update_mr.add_argument("--tag",
+                               help='put a speficic tag ex: 0.2.0')
+        update_mr.add_argument("--replace-existing-labels", action='store_true',
+                               help='replace labels')
+        collect_mr = subparsers.add_parser('collect')
+        collect_mr.add_argument('release_milestone',
+                                help='milestone representing the release')
+        collect_mr.add_argument('group_id',
+                                help='ID of the group that sprint milestones belong to')
+        collect_mr.add_argument('sprint_milestones', nargs='+',
+                                help='one or more milestone titles representing sprints')
+
         subparsers = changelog_group.add_subparsers(dest='action')
-        print_changelog = subparsers.add_parser('print', help='print changelog')
+        print_changelog = subparsers.add_parser('print',
+                                                help='print changelog')
         print_changelog.add_argument("tag",
-        help='generate changelog for specific tag ex: 0.2.0')
-        push_changelog = subparsers.add_parser('push', help='Push changelog to releases in gitlab')
+                                     help='generate changelog for specific tag ex: 0.2.0')
+        push_changelog = subparsers.add_parser('push',
+                                               help='Push changelog to releases in gitlab')
         push_changelog.add_argument("tag",
-        help='generate changelog for specific tag ex: 0.2.0')
+                                    help='generate changelog for specific tag ex: 0.2.0')
+        render_changelog = subparsers.add_parser('render',
+                                                 help='Render changelog')
+        render_changelog.add_argument("release_milestones", nargs='+',
+                                      help="milestones representing one or more releases")
+        render_changelog.add_argument("--labels", default='',
+                                      help='Comma separated list of labels for filtering MRs')
+        render_changelog.add_argument("--strip-internals", action='store_true',
+                                      help="strip internal information (MRs, authors, etc.) from output")
+        render_changelog.add_argument("--strip-version-name-prefix",
+                                      help="Prefix that shall be stripped from version tags (i.e. milestones) for output")
         arguments = parser.parse_args()
+
         if "command" in arguments:
             if arguments.command =="mr":
                 if arguments.action == "update" and (not arguments.label and not arguments.tag):
@@ -144,15 +328,22 @@ def init_argparse():
                     changelog_group.error("One action is required")
         else:
             parser.error("One command is needed")
+
     except argparse.ArgumentError as e:
-        log.error("Error parsing arguments")
+        print("Error parsing arguments")
         raise e
+
     else:
-        log.debug(f"Arguments have been parsed: {arguments}")
         return arguments
 
 if __name__ == '__main__':
     args = init_argparse()
+
+    if not args.quiet:
+        log.basicConfig(format=args.log_format, level=log.INFO)
+    else:
+        log.basicConfig(format=args.log_format)
+
     if args.gitlab_url is not None and args.gitlab_token is not None:
         gl = gitlab.Gitlab(args.gitlab_url, private_token=args.gitlab_token)
     else:
@@ -161,6 +352,7 @@ if __name__ == '__main__':
         except gitlab.config.GitlabConfigMissingError as e:
             print(e)
             exit()
+
     try:
         if args.project.isdecimal():
             projects = [gl.projects.get(args.project)]
@@ -176,13 +368,37 @@ if __name__ == '__main__':
         print("can't find the project {}\n {}".format(args.project, projects))
         exit()
     project = projects[0]
+
+    if not args.force:
+        log.info("===== DRY RUN =====")
+
     if args.command == "mr":
         if args.action == "ls":
             list_mrs(project, args)
         if args.action == "update":
             update_mr(project, args)
+        if args.action == "collect":
+            group = None
+            try:
+                group = gl.groups.get(args.group_id)
+            except exceptions.MissingSchema:
+                log.error("Error with the URL defined")
+                exit()
+            except gitlab.exceptions.GitlabAuthenticationError:
+                log.error("Wrong private token")
+                exit()
+            if group is None:
+                log.error(f"Group {args.group_id} not found!")
+                exit()
+            collect_mr(group, project, args)
     if args.command == "changelog":
         push = False
         if args.action == "push":
             push = True
-        print_changelog(project, args.tag, push)
+        if args.action == "print":
+            print_changelog(project, args, push)
+        if args.action == "render":
+            render_changelog(gl, project, args)
+
+    if not args.force:
+        log.info("===== DRY RUN =====")
