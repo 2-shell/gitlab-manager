@@ -21,7 +21,7 @@ class MergeRequest:
 
 def list_mrs(project, wip):
     print("\nHere is the list of MRs for your chosen project:\n")
-    mrs = project.mergerequests.list(state='opened', order_by='updated_at', wip=wip)
+    mrs = project.mergerequests.list(state='opened', order_by='updated_at', wip=wip, all=True)
     all_mr = ""
     for mr in mrs:
         current = MergeRequest(mr)
