@@ -33,24 +33,26 @@ def list_mrs(project, wip, ids_only=False):
     print(all_mr)
     return all_mr
 
-def update_mr(project, mr_id, label=None, tag=None):
-    mr = project.mergerequests.get(mr_id)
-    if label is not None:
-        mr.labels = [label]
-    
-    if tag is not None:
-        milestones = project.milestones.list(state='active', search=tag)
-        if len(milestones) == 1:
-            milestone = milestones[0]
-        elif len(milestones) == 0:
-            print("create milestone")
-            milestone = project.milestones.create({'title': tag})
-        else:
-            print("please verify your tag")
-            exit()
-        mr.milestone_id = milestone.id
-    mr.save()
-    
+def update_mr(project, mr_ids, label=None, tag=None, keep_existing_labels=False):
+    mrs = project.mergerequests.list(query_parameters={'iids[]': ','.join(mr_ids)})
+    for mr in mrs:
+        if label is not None and label not in mr.labels:
+            if keep_existing_labels:
+                mr.labels.append(label)
+            else:
+                mr.labels = [label]
+        if tag is not None:
+            milestones = project.milestones.list(state='active', search=tag)
+            if len(milestones) == 1:
+                milestone = milestones[0]
+            elif len(milestones) == 0:
+                print("create milestone")
+                milestone = project.milestones.create({'title': tag})
+            else:
+                print("please verify your tag")
+                exit()
+            mr.milestone_id = milestone.id
+        mr.save()
 
 def print_changelog(project, tag, push=False):
     print("\nYour changelog for {} on Project {}:\n".format(tag, project.name))
@@ -89,11 +91,15 @@ def init_argparse():
         ls_mr.add_argument("--wip", dest='wip', action='store', type=str,
         help='search wip or not', choices=['yes', 'no'])
         update_mr = subparsers.add_parser('update')
-        update_mr.add_argument('mr_id')
+        update_mr.add_argument('mr_ids', nargs='+',
+                               help='one or more MR ids')
         update_mr.add_argument("--label", dest='label', action='store', type=str,
         help='put a speficic label ex: Feature')
         update_mr.add_argument("--tag", dest='tag', action='store', type=str,
         help='put a speficic tag ex: 0.2.0')
+        update_mr.add_argument("--keep-existing-labels", dest='keep_existing_labels',
+                               action='store_true',
+                               help='do not replace labels')
         
         subparsers = changelog_group.add_subparsers(dest='action')
         print_changelog = subparsers.add_parser('print', help='print changelog')
@@ -150,7 +156,7 @@ if __name__ == '__main__':
         if args.action == "ls":
             list_mrs(project, args.wip, args.output_ids)
         if args.action == "update":
-            update_mr(project, args.mr_id, args.label, args.tag)
+            update_mr(project, args.mr_ids, args.label, args.tag, args.keep_existing_labels)
     if args.command == "changelog":
         push = False
         if args.action == "push":
