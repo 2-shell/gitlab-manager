@@ -16,16 +16,20 @@ class MergeRequest:
             self.Label = "[{}]".format(mr.labels[0])
             
     
-    def print_mr(self):
-        return "### {}: {}\n\n{}\n\n    * by: {}\n\n    * Merge Request ID:{}\n".format(self.Label, self.Title, self.Description, self.Author, self.Id)
+    def print_mr(self, ids_only=False):
+        if ids_only:
+            return f"{self.Id} "
+        else:
+            return "### {}: {}\n\n{}\n\n    * by: {}\n\n    * Merge Request ID:{}\n".format(self.Label, self.Title, self.Description, self.Author, self.Id)
 
-def list_mrs(project, wip):
-    print("\nHere is the list of MRs for your chosen project:\n")
+def list_mrs(project, wip, ids_only=False):
+    if not ids_only:
+        print("\nHere is the list of MRs for your chosen project:\n")
     mrs = project.mergerequests.list(state='opened', order_by='updated_at', wip=wip, all=True)
     all_mr = ""
     for mr in mrs:
         current = MergeRequest(mr)
-        all_mr = all_mr + "{}\n\n".format(current.print_mr())
+        all_mr = all_mr + "{}\n\n".format(current.print_mr(ids_only))
     print(all_mr)
     return all_mr
 
@@ -80,6 +84,8 @@ def init_argparse():
 
         subparsers = mr_group.add_subparsers(dest='action')
         ls_mr = subparsers.add_parser('ls')
+        ls_mr.add_argument("--ids", dest='output_ids', action='store_true',
+                           help='print MR ids only')
         ls_mr.add_argument("--wip", dest='wip', action='store', type=str,
         help='search wip or not', choices=['yes', 'no'])
         update_mr = subparsers.add_parser('update')
@@ -142,7 +148,7 @@ if __name__ == '__main__':
     project = projects[0]
     if args.command == "mr":
         if args.action == "ls":
-            list_mrs(project, args.wip)
+            list_mrs(project, args.wip, args.output_ids)
         if args.action == "update":
             update_mr(project, args.mr_id, args.label, args.tag)
     if args.command == "changelog":
